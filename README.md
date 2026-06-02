@@ -7,11 +7,10 @@
 你的场景优先使用这一条：
 
 ```bash
-./fast-sync --set-default 3090-1
-./fast-sync
+./fast-sync 3090-1
 ```
 
-第一条只需要在换新服务器时跑一次，保存默认 SSH 别名。第二条才是真正同步，默认等价于 `./fast-sync --offline 3090-1`。
+这条默认会做完整离线迁移：终端环境加 Codex/Claude。主机名不能省，避免误同步到旧服务器。
 
 跑完后登录服务器验证：
 
@@ -20,6 +19,8 @@ ssh 3090-1
 nvim --version
 yazi --version
 zellij --version
+codex --version
+claude --version
 source ~/.bashrc
 yz
 ```
@@ -27,7 +28,7 @@ yz
 以后只是改了配置，继续跑这一条就可以；它会重新覆盖远端的配置、程序和插件缓存。
 
 ```bash
-./fast-sync
+./fast-sync 3090-1
 ```
 
 如果你临时想同步到另一台服务器，不改默认值也可以直接指定：
@@ -36,7 +37,46 @@ yz
 ./fast-sync 5090-1
 ```
 
-这会临时等价于 `./fast-sync --offline 5090-1`。
+这会临时等价于 `./fast-sync --offline --ai 5090-1`。
+
+如果只想补同步 Codex/Claude，不同步终端环境：
+
+```bash
+./fast-sync --ai 3090-1
+```
+
+如果只想同步终端环境，不同步 Codex/Claude：
+
+```bash
+./fast-sync --offline 3090-1
+```
+
+`--ai` 会同步 Codex/Claude 的本地安装和配置，包括：
+
+```text
+~/.codex
+~/.claude
+~/.claude.json
+~/.local/share/claude
+当前 codex 使用的 Node 运行时和 npm 全局包
+```
+
+远端会创建：
+
+```text
+/usr/local/bin/codex
+/usr/local/bin/claude
+```
+
+Codex 如果是 nvm/npm 全局安装，脚本会从 `codex` 入口一路向上查找最近的 `bin/node`，然后把这个 Node 环境一起同步到远端。这样远端不需要自己安装 Node 或 npm 包。
+
+如果前面终端环境已经同步成功，只是 AI 部分失败或后来才想补上，直接跑：
+
+```bash
+./fast-sync --ai 3090-1
+```
+
+这部分体积会明显更大。按当前本机内容估算约 `1.6G`，而且包含登录状态、token、历史记录等敏感信息，只建议同步到你完全信任的自用 root 服务器。
 
 普通配置同步会镜像这些目录到远端 `/root`：
 
@@ -97,10 +137,10 @@ zellij --version
 3. 同步本机的 nvim/yazi/zellij 程序本体到远端
 ```
 
-之后本地配置更新了，如果已经保存默认目标，再跑：
+之后本地配置更新了，再跑：
 
 ```bash
-./fast-sync
+./fast-sync 3090-1
 ```
 
 远端配置会跟着本地更新。
@@ -108,7 +148,7 @@ zellij --version
 也可以监听本地配置变化，自动同步：
 
 ```bash
-./fast-sync --watch
+./fast-sync --watch 3090-1
 ```
 
 `--watch` 需要本地 WSL 装有 `inotifywait`：
@@ -194,8 +234,7 @@ Host 5090-1
 就直接跑：
 
 ```bash
-./fast-sync --set-default 5090-1
-./fast-sync
+./fast-sync 5090-1
 ```
 
 ## 注意
@@ -203,3 +242,5 @@ Host 5090-1
 当前本机的 `yazi.toml` 里有 WSL 专用的 `wslview` 和 `explorer.exe` 打开方式。脚本同步后会在远端把它们改成服务器安全命令，本地配置不会被改。
 
 `--offline` 可以把你的终端工作环境几乎完整搬过去，但不建议也不会直接复制 apt/dpkg 的系统包数据库。像 `/usr/bin/git`、`/usr/bin/curl`、`/lib`、`/var/lib/dpkg` 这类系统内容直接 rsync 可能破坏远端包管理状态。脚本会自动同步本地能安全携带的静态辅助工具，例如 `rg`、`fzf`。如果某个插件运行时硬性依赖远端系统包，例如 `git` 或编译工具，那么那部分仍然需要远端已有这些系统包，或者改用 `--all` 让 apt 安装。
+
+`--ai` 会复制认证和会话相关文件。服务器退租前建议手动删除远端的 `/root/.codex`、`/root/.claude`、`/root/.claude.json`、`/root/.local/share/claude`。

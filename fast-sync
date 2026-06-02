@@ -2,17 +2,15 @@
 set -euo pipefail
 
 REMOTE_HOME="/root"
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-DEFAULT_TARGET_FILE="$SCRIPT_DIR/.fast-sync-target"
 DELETE=1
 DRY_RUN=0
 DO_BOOTSTRAP=0
 DO_BINS=0
 DO_CONFIGS=1
 DO_OFFLINE=0
+DO_AI=0
 OFFLINE_ACTIVE=0
 WATCH=0
-SET_DEFAULT=0
 MODE_SELECTED=0
 TARGET=""
 
@@ -22,18 +20,17 @@ Usage:
   ./fast-sync [options] HOST[:REMOTE_HOME]
 
 Examples:
-  ./fast-sync --set-default 3090-1
-  ./fast-sync
   ./fast-sync 3090-1
   ./fast-sync --all 3090-1
   ./fast-sync --bins 3090-1:/root
   ./fast-sync --offline 3090-1
+  ./fast-sync --ai 3090-1
   ./fast-sync --dry-run 3090-1
 
 Options:
-  --set-default HOST Save the default SSH host used by ./fast-sync.
   --all             Run bootstrap, sync configs, and sync binaries.
   --offline         Sync configs, binaries, plugins, caches without remote downloads.
+  --ai              Sync local Codex/Claude installs and config.
   --bootstrap       Install base Ubuntu packages needed by the config.
   --bins            Sync local nvim/yazi/zellij binaries too.
   --configs         Sync config directories. This is the default.
@@ -44,15 +41,15 @@ Options:
   --watch           Keep watching local config changes and resync.
   -h, --help        Show this help.
 
-By default this mirrors:
+Without an explicit mode, ./fast-sync HOST runs --offline --ai.
+
+Config sync mirrors:
   ~/.config/nvim    -> HOST:/root/.config/nvim
   ~/.config/yazi    -> HOST:/root/.config/yazi
   ~/.config/zellij  -> HOST:/root/.config/zellij
 
 For a new server that should not download tools/plugins itself:
-  ./fast-sync --offline HOST
-
-With a saved default host, ./fast-sync runs --offline against that host.
+  ./fast-sync HOST
 EOF
 }
 
@@ -136,22 +133,6 @@ parse_target() {
   [[ -n "$TARGET" ]] || die "missing HOST"
 }
 
-load_default_target() {
-  [[ -f "$DEFAULT_TARGET_FILE" ]] || return 1
-  local raw
-  raw=$(sed -n '1p' "$DEFAULT_TARGET_FILE")
-  [[ -n "$raw" ]] || return 1
-  parse_target "$raw"
-}
-
-save_default_target() {
-  local raw=$1
-  [[ -n "$raw" ]] || die "--set-default needs HOST[:REMOTE_HOME]"
-  printf '%s\n' "$raw" > "$DEFAULT_TARGET_FILE"
-  printf '==> default target saved: %s\n' "$raw"
-  printf '==> next time run: ./fast-sync\n'
-}
-
 remote_prepare() {
   local host=$1
 
@@ -190,7 +171,10 @@ sync_dir() {
   local dest=$3
   local args=()
 
-  [[ -d "$src" ]] || die "local directory not found: $src"
+  [[ -d "$src" ]] || {
+    printf 'skip missing directory: %s\n' "$src"
+    return 0
+  }
   mapfile -t args < <(rsync_args)
 
   printf '==> %s -> %s:%s\n' "$src" "$host" "$dest"
@@ -208,7 +192,10 @@ sync_file() {
   local dest_parent
   local args=()
 
-  [[ -f "$src" ]] || die "local file not found: $src"
+  [[ -f "$src" ]] || {
+    printf 'skip missing file: %s\n' "$src"
+    return 0
+  }
   mapfile -t args < <(rsync_args)
   dest_parent=$(dirname "$dest")
 
@@ -261,7 +248,11 @@ sync_configs() {
     sync_dir "$host" "$HOME/.config/yazi" "$REMOTE_HOME/.config/yazi"
     sync_dir "$host" "$HOME/.config/zellij" "$REMOTE_HOME/.config/zellij"
   fi
-  patch_remote_yazi_for_server "$host"
+  if [[ -f "$HOME/.config/yazi/yazi.toml" ]]; then
+    patch_remote_yazi_for_server "$host"
+  else
+    printf 'skip yazi server opener patch: %s\n' "$HOME/.config/yazi/yazi.toml"
+  fi
 }
 
 sync_runtime_data() {
@@ -277,6 +268,108 @@ sync_runtime_data() {
 
   tar_sync_path "$host" "$HOME/.local/share/zellij" "$REMOTE_HOME/.local/share/zellij"
   tar_sync_path "$host" "$HOME/.cache/zellij" "$REMOTE_HOME/.cache/zellij"
+}
+
+node_root_from_command() {
+  local name=$1
+  local bin dir
+
+  bin=$(resolved_command "$name")
+  dir=$(dirname "$bin")
+
+  while [[ "$dir" != "/" ]]; do
+    if [[ -x "$dir/bin/node" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir=$(dirname "$dir")
+  done
+
+  die "cannot determine Node root for $name from $bin"
+}
+
+sync_ai_tools() {
+  local host=$1
+  local arch
+  local node_root
+  local claude_bin
+
+  require_remote_command "$host" tar
+  require_remote_command "$host" uname
+  require_remote_command "$host" mktemp
+
+  arch=$(run_ssh "$host" 'uname -m')
+  case "$arch" in
+    x86_64|amd64) ;;
+    *) die "remote arch is $arch; local AI binaries in this setup are x86_64 only" ;;
+  esac
+
+  if command -v codex >/dev/null 2>&1; then
+    node_root=$(node_root_from_command codex)
+    tar_sync_path "$host" "$node_root" "$REMOTE_HOME/.local/opt/node-codex"
+    tar_sync_path "$host" "$HOME/.codex" "$REMOTE_HOME/.codex"
+  else
+    printf 'skip codex: local command not found\n'
+  fi
+
+  if command -v claude >/dev/null 2>&1; then
+    claude_bin=$(resolved_command claude)
+    tar_sync_path "$host" "$HOME/.local/share/claude" "$REMOTE_HOME/.local/share/claude"
+    tar_sync_path "$host" "$claude_bin" "$REMOTE_HOME/.local/share/claude/current-claude"
+    tar_sync_path "$host" "$HOME/.claude" "$REMOTE_HOME/.claude"
+    tar_sync_path "$host" "$HOME/.claude.json" "$REMOTE_HOME/.claude.json"
+  else
+    printf 'skip claude: local command not found\n'
+  fi
+
+  install_remote_ai_entrypoints "$host"
+  verify_remote_ai_tools "$host"
+}
+
+install_remote_ai_entrypoints() {
+  local host=$1
+  local remote_home_q
+
+  [[ "$DRY_RUN" == 0 ]] || {
+    printf 'dry-run: would install remote codex/claude entrypoints\n'
+    return 0
+  }
+
+  remote_home_q=$(sq "$REMOTE_HOME")
+  run_ssh "$host" "REMOTE_HOME=$remote_home_q sh -s" <<'SH'
+set -e
+if [ -x "$REMOTE_HOME/.local/opt/node-codex/bin/node" ] && [ -e "$REMOTE_HOME/.local/opt/node-codex/bin/codex" ]; then
+  ln -sf "$REMOTE_HOME/.local/opt/node-codex/bin/node" /usr/local/bin/node
+  ln -sf "$REMOTE_HOME/.local/opt/node-codex/bin/npm" /usr/local/bin/npm
+  ln -sf "$REMOTE_HOME/.local/opt/node-codex/bin/npx" /usr/local/bin/npx
+  ln -sf "$REMOTE_HOME/.local/opt/node-codex/bin/codex" /usr/local/bin/codex
+fi
+if [ -x "$REMOTE_HOME/.local/share/claude/current-claude" ]; then
+  chmod +x "$REMOTE_HOME/.local/share/claude/current-claude"
+  ln -sf "$REMOTE_HOME/.local/share/claude/current-claude" /usr/local/bin/claude
+fi
+SH
+}
+
+verify_remote_ai_tools() {
+  local host=$1
+
+  [[ "$DRY_RUN" == 0 ]] || {
+    printf 'dry-run: would verify remote codex/claude startup\n'
+    return 0
+  }
+
+  printf '==> verify remote AI tools\n'
+  run_ssh "$host" 'set -e
+export PATH="/usr/local/bin:$PATH"
+for cmd in codex claude; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    "$cmd" --version >/dev/null 2>&1 && echo "$cmd: ok" || echo "$cmd: installed but failed to start"
+  else
+    echo "$cmd: missing"
+  fi
+done
+'
 }
 
 is_static_binary() {
@@ -529,6 +622,9 @@ sync_once() {
 
   if [[ "$DO_OFFLINE" == 1 ]]; then
     sync_offline "$host"
+    if [[ "$DO_AI" == 1 ]]; then
+      sync_ai_tools "$host"
+    fi
     printf '==> done: %s\n' "$host"
     return 0
   fi
@@ -545,6 +641,10 @@ sync_once() {
 
   if [[ "$DO_BINS" == 1 ]]; then
     sync_binaries "$host"
+  fi
+
+  if [[ "$DO_AI" == 1 ]]; then
+    sync_ai_tools "$host"
   fi
 
   printf '==> done: %s\n' "$host"
@@ -581,12 +681,6 @@ watch_configs() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --set-default)
-      [[ $# -ge 2 ]] || die "--set-default needs HOST[:REMOTE_HOME]"
-      save_default_target "$2"
-      SET_DEFAULT=1
-      shift 2
-      ;;
     --all)
       MODE_SELECTED=1
       DO_BOOTSTRAP=1
@@ -600,6 +694,14 @@ while [[ $# -gt 0 ]]; do
       DO_BOOTSTRAP=0
       DO_BINS=0
       DO_CONFIGS=1
+      shift
+      ;;
+    --ai)
+      if [[ "$MODE_SELECTED" == 0 ]]; then
+        DO_CONFIGS=0
+      fi
+      MODE_SELECTED=1
+      DO_AI=1
       shift
       ;;
     --bootstrap)
@@ -653,33 +755,25 @@ while [[ $# -gt 0 ]]; do
     *)
       [[ -z "$TARGET" ]] || die "only one HOST is supported per run"
       parse_target "$1"
-      if [[ "$MODE_SELECTED" == 0 ]]; then
-        DO_OFFLINE=1
-      fi
       shift
       ;;
   esac
 done
 
-if [[ "$SET_DEFAULT" == 1 ]]; then
-  exit 0
+if [[ -z "$TARGET" ]]; then
+  usage
+  printf '\nfast-sync: HOST is required. Example: ./fast-sync 3090-1\n' >&2
+  exit 1
 fi
 
-if [[ -z "$TARGET" ]]; then
-  if load_default_target; then
-    if [[ "$MODE_SELECTED" == 0 ]]; then
-      DO_OFFLINE=1
-    fi
-  else
-    usage
-    printf '\nfast-sync: no HOST provided and no default target saved. Run: ./fast-sync --set-default HOST\n' >&2
-    exit 1
-  fi
+if [[ "$MODE_SELECTED" == 0 ]]; then
+  DO_OFFLINE=1
+  DO_AI=1
 fi
 
 command -v ssh >/dev/null 2>&1 || die "local ssh not found"
 command -v tar >/dev/null 2>&1 || die "local tar not found"
-if [[ "$DO_OFFLINE" == 0 ]]; then
+if [[ "$DO_OFFLINE" == 0 && ( "$DO_CONFIGS" == 1 || "$DO_BINS" == 1 ) ]]; then
   command -v rsync >/dev/null 2>&1 || die "local rsync not found"
 fi
 
