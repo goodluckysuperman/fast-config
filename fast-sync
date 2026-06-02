@@ -12,6 +12,7 @@ DO_AI=0
 OFFLINE_ACTIVE=0
 WATCH=0
 MODE_SELECTED=0
+REMOTE_RSYNC_AVAILABLE=""
 TARGET=""
 
 usage() {
@@ -121,6 +122,33 @@ rsync_args() {
   printf '%s\n' "${args[@]}"
 }
 
+can_use_rsync_transport() {
+  local host=$1
+
+  command -v rsync >/dev/null 2>&1 || return 1
+
+  if [[ -z "$REMOTE_RSYNC_AVAILABLE" ]]; then
+    if remote_has_command "$host" rsync; then
+      REMOTE_RSYNC_AVAILABLE=1
+    else
+      REMOTE_RSYNC_AVAILABLE=0
+    fi
+  fi
+
+  [[ "$REMOTE_RSYNC_AVAILABLE" == 1 ]]
+}
+
+require_transfer_transport() {
+  local host=$1
+
+  if can_use_rsync_transport "$host"; then
+    return 0
+  fi
+
+  require_remote_command "$host" tar
+  require_remote_command "$host" mktemp
+}
+
 parse_target() {
   local raw=$1
   if [[ "$raw" == *:* ]]; then
@@ -177,10 +205,13 @@ sync_dir() {
   }
   mapfile -t args < <(rsync_args)
 
-  printf '==> %s -> %s:%s\n' "$src" "$host" "$dest"
+  printf '==> [rsync] %s -> %s:%s\n' "$src" "$host" "$dest"
   if ! remote_mkdir "$host" "$dest"; then
-    printf 'dry-run: destination does not exist yet; skipping rsync preview for %s:%s\n' "$host" "$dest"
-    return 0
+    if [[ "$DRY_RUN" == 1 ]]; then
+      printf 'dry-run: destination does not exist yet; skipping rsync preview for %s:%s\n' "$host" "$dest"
+      return 0
+    fi
+    die "failed to create remote directory: $host:$dest"
   fi
   rsync "${args[@]}" "$src/" "$host:$dest/"
 }
@@ -199,10 +230,13 @@ sync_file() {
   mapfile -t args < <(rsync_args)
   dest_parent=$(dirname "$dest")
 
-  printf '==> %s -> %s:%s\n' "$src" "$host" "$dest"
+  printf '==> [rsync] %s -> %s:%s\n' "$src" "$host" "$dest"
   if ! remote_mkdir "$host" "$dest_parent"; then
-    printf 'dry-run: destination parent does not exist yet; skipping rsync preview for %s:%s\n' "$host" "$dest"
-    return 0
+    if [[ "$DRY_RUN" == 1 ]]; then
+      printf 'dry-run: destination parent does not exist yet; skipping rsync preview for %s:%s\n' "$host" "$dest"
+      return 0
+    fi
+    die "failed to create remote directory: $host:$dest_parent"
   fi
   rsync "${args[@]}" "$src" "$host:$dest"
 }
@@ -221,13 +255,24 @@ tar_sync_path() {
     return 0
   }
 
+  if can_use_rsync_transport "$host"; then
+    if [[ -d "$src" ]]; then
+      sync_dir "$host" "$src" "$dest"
+    elif [[ -f "$src" ]]; then
+      sync_file "$host" "$src" "$dest"
+    else
+      printf 'skip unsupported path type for rsync transport: %s\n' "$src"
+    fi
+    return 0
+  fi
+
   parent=$(dirname "$src")
   base=$(basename "$src")
   dest_q=$(sq "$dest")
   parent_q=$(sq "$(dirname "$dest")")
   base_q=$(sq "$base")
 
-  printf '==> %s -> %s:%s\n' "$src" "$host" "$dest"
+  printf '==> [tar] %s -> %s:%s\n' "$src" "$host" "$dest"
   if [[ "$DRY_RUN" == 1 ]]; then
     printf 'dry-run: would tar sync %s to %s:%s\n' "$src" "$host" "$dest"
     return 0
@@ -294,9 +339,8 @@ sync_ai_tools() {
   local node_root
   local claude_bin
 
-  require_remote_command "$host" tar
   require_remote_command "$host" uname
-  require_remote_command "$host" mktemp
+  require_transfer_transport "$host"
 
   arch=$(run_ssh "$host" 'uname -m')
   case "$arch" in
@@ -601,10 +645,9 @@ ensure_remote_profile_path() {
 sync_offline() {
   local host=$1
 
-  require_remote_command "$host" tar
   require_remote_command "$host" uname
-  require_remote_command "$host" mktemp
   require_remote_command "$host" awk
+  require_transfer_transport "$host"
 
   OFFLINE_ACTIVE=1
   remote_prepare "$host"

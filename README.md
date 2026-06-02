@@ -218,6 +218,72 @@ yz
 
 `ya` 是 yazi 自带 helper 程序，不能替代这个目录跳转功能。
 
+## 工作原理
+
+默认同步会自动选择传输方式：
+
+```text
+本地和远端都有 rsync -> 用 rsync 快速增量同步
+远端没有 rsync        -> 回退到 tar | ssh | tar
+```
+
+`rsync` 快路径使用的核心参数是：
+
+```bash
+rsync -avzP --delete --no-owner --no-group
+```
+
+这些参数含义是：
+
+```text
+-a                    归档模式，保留目录结构、权限、软链接等
+-v                    显示传输过程
+-z                    通过 SSH 传输时压缩数据
+-P                    显示进度，并保留未完成的部分传输
+--delete              远端目标目录严格跟随本地，本地删了远端也删
+--no-owner --no-group 不把本地用户/用户组强行带到远端 root 环境
+```
+
+脚本没有使用 `--mkpath`、ACL、xattr 等更激进的参数，目的是兼容更多 Ubuntu 服务器，减少因为 rsync 版本或文件系统能力不同导致的问题。
+
+如果远端没有 `rsync`，核心回退方式是 `tar | ssh | tar`：
+
+```bash
+tar -C 本地父目录 -cpf - 目录名 \
+  | ssh 3090-1 'tar -C 远端目录 -xpf -'
+```
+
+这里的 `-cpf -` 表示本地 `tar` 不生成压缩包文件，而是把打包后的数据写到标准输出。中间的管道 `|` 会把这段数据直接交给 `ssh`。`ssh 3090-1 '...'` 会登录服务器，并在服务器上执行引号里的命令，所以远端的 `tar -xpf -` 可以从标准输入读到这批数据并解包。
+
+脚本实际做得更稳一点：
+
+```text
+1. 本地 tar 打包目标目录
+2. 通过 ssh 把 tar 数据流送到服务器
+3. 远端在目标目录旁边创建临时目录
+4. 远端 tar 先解包到临时目录
+5. 解包成功后删除旧目标，再把新目录移动到目标路径
+```
+
+所以即使服务器没有 `rsync`，只要有 Ubuntu 默认常见的 `sh`、`tar`、`mktemp`、`uname`、`awk`，它也能完成同步。后续如果你在远端装了 `rsync`，下一次运行同一条 `./fast-sync 3090-1` 会自动走 rsync 快路径。
+
+执行时输出前缀会告诉你当前传输方式：
+
+```text
+==> [rsync] ...  # 走 rsync 快路径
+==> [tar] ...    # 走 tar 回退路径
+```
+
+“为什么本地脚本能控制服务器上的工具干活”也是这个原因：`ssh HOST 'command'` 本来就表示“在远端执行 command”。例如：
+
+```bash
+ssh 3090-1 'uname -m'
+ssh 3090-1 'mkdir -p /root/.config'
+ssh 3090-1 'ln -sf /opt/fast-config/nvim/bin/nvim /usr/local/bin/nvim'
+```
+
+脚本只是把这些远端命令组织起来，并把本地文件通过 SSH 管道送过去。
+
 ## SSH 别名
 
 脚本不会自己解析服务器名字，也不会要求名字必须是 `3090-1`。你传什么 host，它就原样交给 `ssh`、`rsync` 或 `scp/tar` 流程，所以完全遵循 `~/.ssh/config`。
