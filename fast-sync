@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_HOME="/root"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+DEFAULT_TARGET_FILE="$SCRIPT_DIR/.fast-sync-target"
+DELETE=1
+DRY_RUN=0
+DO_BOOTSTRAP=0
+DO_BINS=0
+DO_CONFIGS=1
+DO_OFFLINE=0
+OFFLINE_ACTIVE=0
+WATCH=0
+SET_DEFAULT=0
+MODE_SELECTED=0
+TARGET=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./fast-sync [options] HOST[:REMOTE_HOME]
+
+Examples:
+  ./fast-sync --set-default 3090-1
+  ./fast-sync
+  ./fast-sync 3090-1
+  ./fast-sync --all 3090-1
+  ./fast-sync --bins 3090-1:/root
+  ./fast-sync --offline 3090-1
+  ./fast-sync --dry-run 3090-1
+
+Options:
+  --set-default HOST Save the default SSH host used by ./fast-sync.
+  --all             Run bootstrap, sync configs, and sync binaries.
+  --offline         Sync configs, binaries, plugins, caches without remote downloads.
+  --bootstrap       Install base Ubuntu packages needed by the config.
+  --bins            Sync local nvim/yazi/zellij binaries too.
+  --configs         Sync config directories. This is the default.
+  --no-configs      Do not sync config directories.
+  --remote-home DIR Remote home directory. Default: /root.
+  --no-delete       Do not remove remote files missing locally.
+  --dry-run         Preview actions without writing them when supported.
+  --watch           Keep watching local config changes and resync.
+  -h, --help        Show this help.
+
+By default this mirrors:
+  ~/.config/nvim    -> HOST:/root/.config/nvim
+  ~/.config/yazi    -> HOST:/root/.config/yazi
+  ~/.config/zellij  -> HOST:/root/.config/zellij
+
+For a new server that should not download tools/plugins itself:
+  ./fast-sync --offline HOST
+
+With a saved default host, ./fast-sync runs --offline against that host.
+EOF
+}
+
+die() {
+  printf 'fast-sync: %s\n' "$*" >&2
+  exit 1
+}
+
+sq() {
+  printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
+run_ssh() {
+  local host=$1
+  shift
+  ssh "$host" "$@"
+}
+
+remote_has_command() {
+  local host=$1
+  local name=$2
+  local name_q
+  name_q=$(sq "$name")
+
+  run_ssh "$host" "command -v $name_q >/dev/null 2>&1"
+}
+
+require_remote_command() {
+  local host=$1
+  local name=$2
+
+  remote_has_command "$host" "$name" || die "remote command not found on $host: $name"
+}
+
+remote_dir_exists() {
+  local host=$1
+  local path=$2
+  local path_q
+  path_q=$(sq "$path")
+
+  run_ssh "$host" "test -d $path_q"
+}
+
+remote_mkdir() {
+  local host=$1
+  local path=$2
+  local path_q
+  path_q=$(sq "$path")
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    if remote_dir_exists "$host" "$path"; then
+      return 0
+    fi
+    printf 'dry-run: would mkdir -p %s:%s\n' "$host" "$path"
+    return 1
+  fi
+
+  run_ssh "$host" "mkdir -p $path_q"
+}
+
+rsync_args() {
+  local args=(-avzP --no-owner --no-group)
+  if [[ "$DELETE" == 1 ]]; then
+    args+=(--delete)
+  fi
+  if [[ "$DRY_RUN" == 1 ]]; then
+    args+=(--dry-run)
+  fi
+  printf '%s\n' "${args[@]}"
+}
+
+parse_target() {
+  local raw=$1
+  if [[ "$raw" == *:* ]]; then
+    TARGET=${raw%%:*}
+    REMOTE_HOME=${raw#*:}
+    [[ -n "$REMOTE_HOME" ]] || REMOTE_HOME="/root"
+  else
+    TARGET=$raw
+  fi
+  [[ -n "$TARGET" ]] || die "missing HOST"
+}
+
+load_default_target() {
+  [[ -f "$DEFAULT_TARGET_FILE" ]] || return 1
+  local raw
+  raw=$(sed -n '1p' "$DEFAULT_TARGET_FILE")
+  [[ -n "$raw" ]] || return 1
+  parse_target "$raw"
+}
+
+save_default_target() {
+  local raw=$1
+  [[ -n "$raw" ]] || die "--set-default needs HOST[:REMOTE_HOME]"
+  printf '%s\n' "$raw" > "$DEFAULT_TARGET_FILE"
+  printf '==> default target saved: %s\n' "$raw"
+  printf '==> next time run: ./fast-sync\n'
+}
+
+remote_prepare() {
+  local host=$1
+
+  remote_mkdir "$host" "$REMOTE_HOME/.config" || true
+}
+
+bootstrap_remote() {
+  local host=$1
+
+  printf '==> bootstrap %s\n' "$host"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    printf 'dry-run: would install base packages on %s with apt-get\n' "$host"
+    return 0
+  fi
+
+  run_ssh "$host" 'set -e
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "apt-get not found; this bootstrap supports Ubuntu/Debian only" >&2
+  exit 1
+fi
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y \
+  rsync git curl ca-certificates python3 \
+  ripgrep fd-find file unzip xz-utils tar gzip \
+  build-essential gcc g++ make
+if ! command -v fd >/dev/null 2>&1 && command -v fdfind >/dev/null 2>&1; then
+  ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+fi
+'
+}
+
+sync_dir() {
+  local host=$1
+  local src=$2
+  local dest=$3
+  local args=()
+
+  [[ -d "$src" ]] || die "local directory not found: $src"
+  mapfile -t args < <(rsync_args)
+
+  printf '==> %s -> %s:%s\n' "$src" "$host" "$dest"
+  if ! remote_mkdir "$host" "$dest"; then
+    printf 'dry-run: destination does not exist yet; skipping rsync preview for %s:%s\n' "$host" "$dest"
+    return 0
+  fi
+  rsync "${args[@]}" "$src/" "$host:$dest/"
+}
+
+sync_file() {
+  local host=$1
+  local src=$2
+  local dest=$3
+  local dest_parent
+  local args=()
+
+  [[ -f "$src" ]] || die "local file not found: $src"
+  mapfile -t args < <(rsync_args)
+  dest_parent=$(dirname "$dest")
+
+  printf '==> %s -> %s:%s\n' "$src" "$host" "$dest"
+  if ! remote_mkdir "$host" "$dest_parent"; then
+    printf 'dry-run: destination parent does not exist yet; skipping rsync preview for %s:%s\n' "$host" "$dest"
+    return 0
+  fi
+  rsync "${args[@]}" "$src" "$host:$dest"
+}
+
+tar_sync_path() {
+  local host=$1
+  local src=$2
+  local dest=$3
+  local parent base
+  local dest_q
+  local parent_q
+  local base_q
+
+  [[ -e "$src" ]] || {
+    printf 'skip missing: %s\n' "$src"
+    return 0
+  }
+
+  parent=$(dirname "$src")
+  base=$(basename "$src")
+  dest_q=$(sq "$dest")
+  parent_q=$(sq "$(dirname "$dest")")
+  base_q=$(sq "$base")
+
+  printf '==> %s -> %s:%s\n' "$src" "$host" "$dest"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    printf 'dry-run: would tar sync %s to %s:%s\n' "$src" "$host" "$dest"
+    return 0
+  fi
+
+  tar -C "$parent" -cpf - "$base" | ssh "$host" "set -e; dest=$dest_q; parent=$parent_q; base=$base_q; mkdir -p \"\$parent\"; tmp=\$(mktemp -d \"\$parent/.fast-sync.XXXXXX\"); trap 'rm -rf \"\$tmp\"' EXIT; tar -C \"\$tmp\" --no-same-owner -xpf -; rm -rf \"\$dest\"; mv \"\$tmp/\$base\" \"\$dest\""
+}
+
+sync_configs() {
+  local host=$1
+
+  if [[ "$OFFLINE_ACTIVE" == 1 ]]; then
+    tar_sync_path "$host" "$HOME/.config/nvim" "$REMOTE_HOME/.config/nvim"
+    tar_sync_path "$host" "$HOME/.config/yazi" "$REMOTE_HOME/.config/yazi"
+    tar_sync_path "$host" "$HOME/.config/zellij" "$REMOTE_HOME/.config/zellij"
+  else
+    sync_dir "$host" "$HOME/.config/nvim" "$REMOTE_HOME/.config/nvim"
+    sync_dir "$host" "$HOME/.config/yazi" "$REMOTE_HOME/.config/yazi"
+    sync_dir "$host" "$HOME/.config/zellij" "$REMOTE_HOME/.config/zellij"
+  fi
+  patch_remote_yazi_for_server "$host"
+}
+
+sync_runtime_data() {
+  local host=$1
+
+  tar_sync_path "$host" "$HOME/.local/share/nvim" "$REMOTE_HOME/.local/share/nvim"
+  tar_sync_path "$host" "$HOME/.local/state/nvim" "$REMOTE_HOME/.local/state/nvim"
+  tar_sync_path "$host" "$HOME/.cache/nvim" "$REMOTE_HOME/.cache/nvim"
+
+  tar_sync_path "$host" "$HOME/.local/share/yazi" "$REMOTE_HOME/.local/share/yazi"
+  tar_sync_path "$host" "$HOME/.local/state/yazi" "$REMOTE_HOME/.local/state/yazi"
+  tar_sync_path "$host" "$HOME/.cache/yazi" "$REMOTE_HOME/.cache/yazi"
+
+  tar_sync_path "$host" "$HOME/.local/share/zellij" "$REMOTE_HOME/.local/share/zellij"
+  tar_sync_path "$host" "$HOME/.cache/zellij" "$REMOTE_HOME/.cache/zellij"
+}
+
+is_static_binary() {
+  local path=$1
+
+  file "$path" 2>/dev/null | grep -Eq 'statically linked|static-pie linked'
+}
+
+sync_optional_tools_offline() {
+  local host=$1
+  local name path resolved
+
+  for name in rg fzf; do
+    path=$(command -v "$name" 2>/dev/null || true)
+    [[ -n "$path" ]] || continue
+    resolved=$(readlink -f "$path")
+    [[ -f "$resolved" ]] || continue
+    if is_static_binary "$resolved"; then
+      tar_sync_path "$host" "$resolved" "/usr/local/bin/$name"
+      [[ "$DRY_RUN" == 1 ]] || run_ssh "$host" "chmod +x $(sq "/usr/local/bin/$name")"
+    else
+      printf 'skip non-static optional tool: %s (%s)\n' "$name" "$resolved"
+    fi
+  done
+}
+
+verify_remote_tools() {
+  local host=$1
+  local bashrc
+  local bashrc_q
+
+  [[ "$DRY_RUN" == 0 ]] || {
+    printf 'dry-run: would verify remote nvim/yazi/zellij startup and yz shell function\n'
+    return 0
+  }
+
+  bashrc="$REMOTE_HOME/.bashrc"
+  bashrc_q=$(sq "$bashrc")
+
+  printf '==> verify remote tools\n'
+  ssh "$host" "BASHRC=$bashrc_q sh -s" <<'SH'
+set -e
+export PATH="/usr/local/bin:$PATH"
+for cmd in nvim yazi zellij; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    "$cmd" --version >/dev/null 2>&1 && echo "$cmd: ok" || echo "$cmd: installed but failed to start"
+  else
+    echo "$cmd: missing"
+  fi
+done
+grep -q '^yz() {' "$BASHRC" && echo 'yz: installed in .bashrc' || echo 'yz: missing from .bashrc'
+SH
+}
+
+patch_remote_yazi_for_server() {
+  local host=$1
+  local remote_yazi
+  local remote_yazi_q
+
+  [[ "$DRY_RUN" == 0 ]] || {
+    printf 'dry-run: would patch server-safe yazi openers on %s\n' "$host"
+    return 0
+  }
+
+  remote_yazi="$REMOTE_HOME/.config/yazi/yazi.toml"
+  remote_yazi_q=$(sq "$remote_yazi")
+
+  ssh "$host" "REMOTE_YAZI=$remote_yazi_q sh -s" <<'SH'
+set -e
+tmp="${REMOTE_YAZI}.tmp"
+awk '
+{
+  if ($0 == "  { run = '\''wslview %s1'\'', desc = \"Open in Windows\", for = \"unix\" },") {
+    print "  { run = '\''file -- %s1'\'', desc = \"Inspect\", for = \"unix\" },"
+  } else if ($0 == "  { run = '\''explorer.exe /select,\"$(wslpath -w %s1)\"'\'', desc = \"Reveal in Explorer\", for = \"unix\" },") {
+    print "  { run = '\''echo %s1'\'', desc = \"Print path\", for = \"unix\" },"
+  } else {
+    print
+  }
+}
+' "$REMOTE_YAZI" > "$tmp"
+mv "$tmp" "$REMOTE_YAZI"
+SH
+}
+
+resolved_command() {
+  local name=$1
+  local path
+
+  path=$(command -v "$name" || true)
+  [[ -n "$path" ]] || die "$name not found in PATH"
+  readlink -f "$path"
+}
+
+command_root() {
+  local name=$1
+  local bin root
+
+  bin=$(resolved_command "$name")
+  if [[ "$(basename "$(dirname "$bin")")" == "bin" ]]; then
+    root=$(dirname "$(dirname "$bin")")
+  else
+    root=$(dirname "$bin")
+  fi
+
+  printf '%s\n' "$root"
+}
+
+sync_binaries() {
+  local host=$1
+  local arch
+  local nvim_bin nvim_root
+  local yazi_bin yazi_root
+  local zellij_bin
+
+  arch=$(run_ssh "$host" 'uname -m')
+  case "$arch" in
+    x86_64|amd64) ;;
+    *) die "remote arch is $arch; local binaries in this setup are x86_64 only" ;;
+  esac
+
+  nvim_bin=$(resolved_command nvim)
+  yazi_bin=$(resolved_command yazi)
+  zellij_bin=$(resolved_command zellij)
+
+  if [[ "$(basename "$(dirname "$nvim_bin")")" == "bin" ]]; then
+    nvim_root=$(dirname "$(dirname "$nvim_bin")")
+  else
+    nvim_root=$(dirname "$nvim_bin")
+  fi
+  yazi_root=$(dirname "$yazi_bin")
+
+  sync_dir "$host" "$nvim_root" "/opt/fast-config/nvim"
+  sync_dir "$host" "$yazi_root" "/opt/fast-config/yazi"
+  sync_file "$host" "$zellij_bin" "/usr/local/bin/zellij"
+
+  install_remote_entrypoints "$host"
+}
+
+sync_binaries_offline() {
+  local host=$1
+  local arch
+  local nvim_root yazi_root zellij_bin
+
+  arch=$(run_ssh "$host" 'uname -m')
+  case "$arch" in
+    x86_64|amd64) ;;
+    *) die "remote arch is $arch; local binaries in this setup are x86_64 only" ;;
+  esac
+
+  nvim_root=$(command_root nvim)
+  yazi_root=$(command_root yazi)
+  zellij_bin=$(resolved_command zellij)
+
+  tar_sync_path "$host" "$nvim_root" "/opt/fast-config/nvim"
+  tar_sync_path "$host" "$yazi_root" "/opt/fast-config/yazi"
+  tar_sync_path "$host" "$zellij_bin" "/usr/local/bin/zellij"
+
+  install_remote_entrypoints "$host"
+}
+
+install_remote_entrypoints() {
+  local host=$1
+
+  if [[ "$DRY_RUN" == 0 ]]; then
+    run_ssh "$host" 'set -e
+chmod +x /usr/local/bin/zellij
+ln -sf /opt/fast-config/nvim/bin/nvim /usr/local/bin/nvim
+ln -sf /opt/fast-config/yazi/yazi /usr/local/bin/yazi
+if [ -x /opt/fast-config/yazi/ya ]; then
+  ln -sf /opt/fast-config/yazi/ya /usr/local/bin/ya
+fi
+'
+    install_remote_yz_function "$host"
+  fi
+}
+
+install_remote_yz_function() {
+  local host=$1
+  local bashrc
+  local bashrc_q
+
+  bashrc="$REMOTE_HOME/.bashrc"
+  bashrc_q=$(sq "$bashrc")
+
+  ssh "$host" "BASHRC=$bashrc_q sh -s" <<'SH'
+set -e
+touch "$BASHRC"
+tmp="${BASHRC}.tmp"
+awk '
+  /^# >>> fast-sync yz >>>$/ { skip=1; next }
+  /^# <<< fast-sync yz <<<$/{ skip=0; next }
+  skip != 1 { print }
+' "$BASHRC" > "$tmp"
+cat >> "$tmp" <<'EOF'
+# >>> fast-sync yz >>>
+yz() {
+  local tmp
+  tmp="$(mktemp -t yazi-cwd.XXXXXX)" || return
+  yazi "$@" --cwd-file="$tmp"
+  if [ -s "$tmp" ]; then
+    local cwd
+    cwd="$(cat "$tmp")"
+    [ -d "$cwd" ] && cd "$cwd"
+  fi
+  rm -f "$tmp"
+}
+# <<< fast-sync yz <<<
+EOF
+mv "$tmp" "$BASHRC"
+SH
+}
+
+ensure_remote_profile_path() {
+  local host=$1
+  local profile
+  local profile_q
+
+  [[ "$DRY_RUN" == 0 ]] || {
+    printf 'dry-run: would ensure /usr/local/bin is in remote PATH\n'
+    return 0
+  }
+
+  profile="$REMOTE_HOME/.profile"
+  profile_q=$(sq "$profile")
+  run_ssh "$host" "touch $profile_q && grep -qxF 'export PATH=\"/usr/local/bin:\$PATH\"' $profile_q || printf '%s\n' 'export PATH=\"/usr/local/bin:\$PATH\"' >> $profile_q"
+}
+
+sync_offline() {
+  local host=$1
+
+  require_remote_command "$host" tar
+  require_remote_command "$host" uname
+  require_remote_command "$host" mktemp
+  require_remote_command "$host" awk
+
+  OFFLINE_ACTIVE=1
+  remote_prepare "$host"
+  sync_configs "$host"
+  sync_binaries_offline "$host"
+  sync_optional_tools_offline "$host"
+  sync_runtime_data "$host"
+  ensure_remote_profile_path "$host"
+  verify_remote_tools "$host"
+  OFFLINE_ACTIVE=0
+}
+
+sync_once() {
+  local host=$1
+
+  if [[ "$DO_OFFLINE" == 1 ]]; then
+    sync_offline "$host"
+    printf '==> done: %s\n' "$host"
+    return 0
+  fi
+
+  if [[ "$DO_BOOTSTRAP" == 1 ]]; then
+    bootstrap_remote "$host"
+  fi
+
+  remote_prepare "$host"
+
+  if [[ "$DO_CONFIGS" == 1 ]]; then
+    sync_configs "$host"
+  fi
+
+  if [[ "$DO_BINS" == 1 ]]; then
+    sync_binaries "$host"
+  fi
+
+  printf '==> done: %s\n' "$host"
+}
+
+watch_configs() {
+  local host=$1
+  local watch_dirs=()
+
+  [[ "$DO_CONFIGS" == 1 ]] || die "--watch currently requires config sync"
+  [[ "$DRY_RUN" == 0 ]] || die "--watch cannot be combined with --dry-run"
+  command -v inotifywait >/dev/null 2>&1 || die "inotifywait not found; install it locally with: sudo apt install inotify-tools"
+
+  for dir in "$HOME/.config/nvim" "$HOME/.config/yazi" "$HOME/.config/zellij"; do
+    [[ -d "$dir" ]] && watch_dirs+=("$dir")
+  done
+  [[ "${#watch_dirs[@]}" -gt 0 ]] || die "no local config directories found to watch"
+
+  sync_once "$host"
+  DO_BOOTSTRAP=0
+  DO_BINS=0
+  if [[ "$DO_OFFLINE" == 1 ]]; then
+    DO_OFFLINE=0
+    OFFLINE_ACTIVE=1
+  fi
+
+  printf '==> watching local config changes; press Ctrl-C to stop\n'
+
+  while inotifywait -qr -e create,modify,delete,move "${watch_dirs[@]}" >/dev/null; do
+    sleep 0.2
+    sync_once "$host"
+  done
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --set-default)
+      [[ $# -ge 2 ]] || die "--set-default needs HOST[:REMOTE_HOME]"
+      save_default_target "$2"
+      SET_DEFAULT=1
+      shift 2
+      ;;
+    --all)
+      MODE_SELECTED=1
+      DO_BOOTSTRAP=1
+      DO_BINS=1
+      DO_CONFIGS=1
+      shift
+      ;;
+    --offline)
+      MODE_SELECTED=1
+      DO_OFFLINE=1
+      DO_BOOTSTRAP=0
+      DO_BINS=0
+      DO_CONFIGS=1
+      shift
+      ;;
+    --bootstrap)
+      MODE_SELECTED=1
+      DO_BOOTSTRAP=1
+      shift
+      ;;
+    --bins)
+      MODE_SELECTED=1
+      DO_BINS=1
+      shift
+      ;;
+    --configs)
+      MODE_SELECTED=1
+      DO_CONFIGS=1
+      shift
+      ;;
+    --no-configs)
+      MODE_SELECTED=1
+      DO_CONFIGS=0
+      shift
+      ;;
+    --remote-home)
+      [[ $# -ge 2 ]] || die "--remote-home needs a value"
+      REMOTE_HOME=$2
+      shift 2
+      ;;
+    --no-delete)
+      DELETE=0
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --watch)
+      WATCH=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      [[ -z "$TARGET" ]] || die "only one HOST is supported per run"
+      parse_target "$1"
+      if [[ "$MODE_SELECTED" == 0 ]]; then
+        DO_OFFLINE=1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ "$SET_DEFAULT" == 1 ]]; then
+  exit 0
+fi
+
+if [[ -z "$TARGET" ]]; then
+  if load_default_target; then
+    if [[ "$MODE_SELECTED" == 0 ]]; then
+      DO_OFFLINE=1
+    fi
+  else
+    usage
+    printf '\nfast-sync: no HOST provided and no default target saved. Run: ./fast-sync --set-default HOST\n' >&2
+    exit 1
+  fi
+fi
+
+command -v ssh >/dev/null 2>&1 || die "local ssh not found"
+command -v tar >/dev/null 2>&1 || die "local tar not found"
+if [[ "$DO_OFFLINE" == 0 ]]; then
+  command -v rsync >/dev/null 2>&1 || die "local rsync not found"
+fi
+
+if [[ "$WATCH" == 1 ]]; then
+  watch_configs "$TARGET"
+else
+  sync_once "$TARGET"
+fi
