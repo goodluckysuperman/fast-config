@@ -126,6 +126,42 @@ sudo apt install inotify-tools
 
 缺少的本地目录会跳过并提示 `skip missing ...`，不会中断。
 
+## Python 和 conda
+
+Python 语法识别主要来自 nvim treesitter parser，例如：
+
+```text
+~/.local/share/nvim/site/parser/python.so
+```
+
+这个文件属于 `~/.local/share/nvim`，默认会被同步，所以本地更新 Python 语法解析后，重新运行：
+
+```bash
+./fast-sync 3090-1
+```
+
+远端也会跟着更新。
+
+Python LSP 当前使用 `pyright`。脚本不会写死 conda 环境名，也不会固定某个 `/root/miniconda3/envs/.../python` 路径。nvim 启动 Pyright 时会读取当前 shell 里的 `python`，找不到时再回退到 `python3`。
+
+所以远端如果要让补全跟随某个 conda 环境，先激活环境再打开 nvim：
+
+```bash
+conda activate your-env
+nvim main.py
+```
+
+如果 nvim 已经打开，再在外面的 shell 切换 conda 环境，已经启动的 Pyright 不会自动换解释器；重新打开 nvim 最稳。
+
+如果本机 `pyright` 是通过 nvm/npm 全局安装的，`--ai` 会把同一个 Node 运行时和 npm 全局包同步到远端，并创建：
+
+```text
+/usr/local/bin/pyright
+/usr/local/bin/pyright-langserver
+```
+
+所以远端不需要再自己 `npm install -g pyright`。
+
 ## Codex 和 Claude
 
 `--ai` 会同步：
@@ -135,7 +171,7 @@ sudo apt install inotify-tools
 ~/.claude
 ~/.claude.json
 ~/.local/share/claude
-当前 codex 使用的 Node 运行时和 npm 全局包
+当前 codex/pyright 使用的 Node 运行时和 npm 全局包
 ```
 
 远端会创建：
@@ -143,9 +179,13 @@ sudo apt install inotify-tools
 ```text
 /usr/local/bin/codex
 /usr/local/bin/claude
+/usr/local/bin/pyright
+/usr/local/bin/pyright-langserver
 ```
 
 Codex 如果是 nvm/npm 全局安装，脚本会从 `codex` 入口一路向上查找最近的 `bin/node`，然后把这个 Node 环境同步到远端。这样远端不需要自己安装 Node 或 npm 包。
+
+如果本机没有 `codex`，但有 `pyright` 或 `pyright-langserver`，脚本也会用它们定位 Node 环境；缺少的命令只会提示跳过。
 
 这部分当前本机估算约 `1.6G`，而且包含登录状态、token、历史记录等敏感信息。只建议同步到你完全信任的自用 root 服务器。
 

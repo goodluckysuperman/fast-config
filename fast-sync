@@ -330,13 +330,15 @@ node_root_from_command() {
     dir=$(dirname "$dir")
   done
 
-  die "cannot determine Node root for $name from $bin"
+  return 1
 }
 
 sync_ai_tools() {
   local host=$1
   local arch
   local node_root
+  local node_source_cmd=""
+  local name
   local claude_bin
 
   require_remote_command "$host" uname
@@ -348,9 +350,24 @@ sync_ai_tools() {
     *) die "remote arch is $arch; local AI binaries in this setup are x86_64 only" ;;
   esac
 
+  for name in codex pyright-langserver pyright basedpyright-langserver basedpyright; do
+    if command -v "$name" >/dev/null 2>&1; then
+      node_source_cmd=$name
+      break
+    fi
+  done
+
+  if [[ -n "$node_source_cmd" ]]; then
+    if node_root=$(node_root_from_command "$node_source_cmd"); then
+      tar_sync_path "$host" "$node_root" "$REMOTE_HOME/.local/opt/node-codex"
+    else
+      printf 'skip node tools: cannot determine Node root from %s\n' "$(resolved_command "$node_source_cmd")"
+    fi
+  else
+    printf 'skip node tools: no local codex/pyright command found\n'
+  fi
+
   if command -v codex >/dev/null 2>&1; then
-    node_root=$(node_root_from_command codex)
-    tar_sync_path "$host" "$node_root" "$REMOTE_HOME/.local/opt/node-codex"
     tar_sync_path "$host" "$HOME/.codex" "$REMOTE_HOME/.codex"
   else
     printf 'skip codex: local command not found\n'
@@ -382,11 +399,13 @@ install_remote_ai_entrypoints() {
   remote_home_q=$(sq "$REMOTE_HOME")
   run_ssh "$host" "REMOTE_HOME=$remote_home_q sh -s" <<'SH'
 set -e
-if [ -x "$REMOTE_HOME/.local/opt/node-codex/bin/node" ] && [ -e "$REMOTE_HOME/.local/opt/node-codex/bin/codex" ]; then
-  ln -sf "$REMOTE_HOME/.local/opt/node-codex/bin/node" /usr/local/bin/node
-  ln -sf "$REMOTE_HOME/.local/opt/node-codex/bin/npm" /usr/local/bin/npm
-  ln -sf "$REMOTE_HOME/.local/opt/node-codex/bin/npx" /usr/local/bin/npx
-  ln -sf "$REMOTE_HOME/.local/opt/node-codex/bin/codex" /usr/local/bin/codex
+NODE_ROOT="$REMOTE_HOME/.local/opt/node-codex"
+if [ -x "$NODE_ROOT/bin/node" ]; then
+  for name in node npm npx corepack codex pyright pyright-langserver basedpyright basedpyright-langserver; do
+    if [ -e "$NODE_ROOT/bin/$name" ]; then
+      ln -sf "$NODE_ROOT/bin/$name" "/usr/local/bin/$name"
+    fi
+  done
 fi
 if [ -x "$REMOTE_HOME/.local/share/claude/current-claude" ]; then
   chmod +x "$REMOTE_HOME/.local/share/claude/current-claude"
@@ -406,7 +425,7 @@ verify_remote_ai_tools() {
   printf '==> verify remote AI tools\n'
   run_ssh "$host" 'set -e
 export PATH="/usr/local/bin:$PATH"
-for cmd in codex claude; do
+for cmd in codex claude pyright; do
   if command -v "$cmd" >/dev/null 2>&1; then
     "$cmd" --version >/dev/null 2>&1 && echo "$cmd: ok" || echo "$cmd: installed but failed to start"
   else
