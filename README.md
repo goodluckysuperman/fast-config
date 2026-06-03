@@ -289,6 +289,24 @@ tar -C 本地父目录 -cpf - 目录名 \
 
 所以即使服务器没有 `rsync`，只要有 Ubuntu 常见的 `sh`、`tar`、`mktemp`、`uname`、`awk`，也可以完成同步。
 
+Codex/Claude 目录里有些运行时文件会在工具启动时持续变化，例如：
+
+```text
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.log
+.tmp
+```
+
+这些文件不是配置迁移的关键内容。tar 回退路径会跳过它们，否则容易出现：
+
+```text
+tar: .codex/logs_2.sqlite-wal: file changed as we read it
+```
+
+有 `rsync` 时通常不会被这个问题卡住；没有 `rsync` 时脚本会用这个规则保证同步能继续完成。
+
 ## 远端命令执行原理
 
 `ssh HOST 'command'` 的语义就是在远端执行命令。例如：
